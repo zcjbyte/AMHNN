@@ -7,7 +7,7 @@ This repository contains the official PyTorch implementation for the paper: **"A
 * `data.py`: Handles hypergraph Laplacian computation, topological feature generation, and the multi-source spreading dynamic models (SI, IC, LT).
 * `training.py`: Contains the training loop, validation logic, and the dynamic weighted binary cross-entropy loss function.
 * `utils.py`: Includes evaluation metrics (Accuracy, F1, AUC) and hypergraph structure augmentation strategies (Dropout and Perturbation).
-* `data/`: Directory to store the real-world hypergraph datasets.
+* `data/`: Directory to store the synthetic and real-world hypergraph datasets.
 
 ## ⚙️ Dependencies
 
