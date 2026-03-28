@@ -1,0 +1,170 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.metrics import roc_auc_score
+import time
+import os
+
+try:
+    from .utils import calculate_accuracy_f1, augment_hypergraph_structure
+except ImportError:
+    from utils import calculate_accuracy_f1, augment_hypergraph_structure
+
+def amhnn_loss(outputs, targets, epsilon=1e-6):
+    N = targets.size(0)
+    pos_sum = targets.sum() + epsilon
+    neg_sum = N - targets.sum() + epsilon
+    w_pos = N / pos_sum
+    w_neg = N / neg_sum
+    preds = torch.sigmoid(outputs)
+    loss = - (w_pos * targets * torch.log(preds + epsilon) + w_neg * (1 - targets) * torch.log(1 - preds + epsilon))
+    return loss.mean()
+
+def test_model(model, test_loader, hypergraph_obj, device):
+    overall_test_accuracy = []
+    overall_test_f1 = []
+    overall_test_auc = []
+    model.eval()
+    
+    with torch.no_grad():
+        for batch_idx, (x, y, idx, infection_graph) in enumerate(test_loader):
+            x, y = x.to(device), y.to(device)
+            x = x.squeeze(0)
+            output, _ = model(x, hypergraph_obj)
+            y = y.squeeze(0)
+            
+            true_sources = [i for i, val in enumerate(y.cpu().numpy()) if val == 1]
+            k = len(true_sources)
+            
+            _, top_indices = torch.topk(output, k)
+            predicted = torch.zeros_like(y)
+            predicted[top_indices] = 1
+            
+            accuracy, f1 = calculate_accuracy_f1(predicted.cpu().tolist(), y.cpu().tolist())
+            auc = roc_auc_score(y.cpu().numpy(), torch.sigmoid(output).cpu().detach().numpy())
+            
+            overall_test_accuracy.append(accuracy)
+            overall_test_f1.append(f1)
+            overall_test_auc.append(auc)
+            
+    avg_accuracy = sum(overall_test_accuracy) / len(overall_test_accuracy) if overall_test_accuracy else 0
+    avg_f1 = sum(overall_test_f1) / len(overall_test_f1) if overall_test_f1 else 0
+    avg_auc = sum(overall_test_auc) / len(overall_test_auc) if overall_test_auc else 0
+    
+    return {
+        'accuracy': overall_test_accuracy,
+        'f1': overall_test_f1,
+        'auc': overall_test_auc,
+        'avg_accuracy': avg_accuracy,
+        'avg_f1': avg_f1,
+        'avg_auc': avg_auc
+    }
+
+def train_amhnn(model, train_loader, val_loader, test_loader, optimizer, device, num_epochs=300, hypergraph_obj=None, save_dir="./checkpoints", source_nodes_count=5, model_name="AMHNN"):
+    os.makedirs(save_dir, exist_ok=True)
+    model_path = os.path.join(save_dir, f'{model_name}.pth')
+    
+    best_val_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
+    
+    history = {'train_loss': [], 'val_loss': [], 'train_f1': [], 'val_f1': [], 'train_auc': [], 'val_auc': []}
+    
+    for epoch in range(num_epochs):
+        augmented_hypergraph = hypergraph_obj
+        if epoch > 0 and epoch % 5 == 0:
+            augmented_hypergraph = augment_hypergraph_structure(hypergraph_obj)
+        
+        model.train()
+        train_losses, train_f1_scores, train_auc_scores = [], [], []
+        
+        for x, y, idx, infection_graph in train_loader:
+            x, y = x.to(device), y.to(device)
+            x, y = x.squeeze(0), y.squeeze(0)
+            
+            output, _ = model(x, augmented_hypergraph)
+            loss = amhnn_loss(output, y)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            train_losses.append(loss.item())
+            
+            true_sources = [i for i, val in enumerate(y.cpu().numpy()) if val == 1]
+            k = len(true_sources)
+            _, top_indices = torch.topk(output, k)
+            predicted = torch.zeros_like(y)
+            predicted[top_indices] = 1
+            
+            _, f1 = calculate_accuracy_f1(predicted.cpu().tolist(), y.cpu().tolist())
+            auc = roc_auc_score(y.cpu().numpy(), torch.sigmoid(output).cpu().detach().numpy())
+            
+            train_f1_scores.append(f1)
+            train_auc_scores.append(auc)
+            
+        avg_train_loss = sum(train_losses) / len(train_losses)
+        avg_train_f1 = sum(train_f1_scores) / len(train_f1_scores)
+        avg_train_auc = sum(train_auc_scores) / len(train_auc_scores)
+        
+        history['train_loss'].append(avg_train_loss)
+        history['train_f1'].append(avg_train_f1)
+        history['train_auc'].append(avg_train_auc)
+        
+        model.eval()
+        val_losses, val_f1_scores, val_auc_scores = [], [], []
+        
+        with torch.no_grad():
+            for x, y, idx, _ in val_loader:
+                x, y = x.to(device), y.to(device)
+                x, y = x.squeeze(0), y.squeeze(0)
+                
+                output, _ = model(x, hypergraph_obj)
+                loss = amhnn_loss(output, y)
+                val_losses.append(loss.item())
+                
+                true_sources = [i for i, val in enumerate(y.cpu().numpy()) if val == 1]
+                k = len(true_sources)
+                _, top_indices = torch.topk(output, k)
+                predicted = torch.zeros_like(y)
+                predicted[top_indices] = 1
+                
+                _, f1 = calculate_accuracy_f1(predicted.cpu().tolist(), y.cpu().tolist())
+                auc = roc_auc_score(y.cpu().numpy(), torch.sigmoid(output).cpu().detach().numpy())
+                
+                val_f1_scores.append(f1)
+                val_auc_scores.append(auc)
+        
+        avg_val_loss = sum(val_losses) / len(val_losses)
+        avg_val_f1 = sum(val_f1_scores) / len(val_f1_scores)
+        avg_val_auc = sum(val_auc_scores) / len(val_auc_scores)
+        
+        history['val_loss'].append(avg_val_loss)
+        history['val_f1'].append(avg_val_f1)
+        history['val_auc'].append(avg_val_auc)
+        
+        scheduler.step(avg_val_loss)
+        
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': best_val_loss,
+            }, model_path)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
+    
+    if os.path.exists(model_path):
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    
+    test_results = test_model(model, test_loader, hypergraph_obj, device)
+    
+    return test_results['accuracy'], test_results['f1'], test_results['auc'], model_name
