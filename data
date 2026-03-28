@@ -1,0 +1,416 @@
+import torch
+from torch.utils.data import Dataset
+import numpy as np
+from collections import defaultdict
+import scipy.sparse as sp
+from scipy.sparse.linalg import eigsh
+import random
+
+class OptimizedHypergraphSourceDataset(Dataset):
+    def __init__(self, inputs, labels, nodes_num, hyperedges, hypergraph_obj=None):
+        self.inputs = inputs
+        self.labels = labels
+        self.nodes_num = nodes_num
+        self.hyperedges = hyperedges
+        self.hypergraph_obj = hypergraph_obj
+        
+        self.node_to_hyperedges = self._build_node_to_hyperedges()
+        self.node_to_neighbors = self._build_node_neighbors()
+        self.node_to_second_neighbors = self._build_second_neighbors()
+        
+        degree_list = [len(self.node_to_hyperedges[node]) for node in range(nodes_num)]
+        total_degree = sum(degree_list) + 1e-8
+        self.degree = [d / total_degree for d in degree_list]
+        
+        self._compute_second_smallest_spectral_feature()
+    
+    def _compute_second_smallest_spectral_feature(self):
+        L_hg = optimized_get_hypergraph_laplacian(self.nodes_num, self.hyperedges)
+        eigvals, eigvecs = eigsh(L_hg, k=2, which='SM', tol=1e-4, maxiter=1000)
+        self.second_smallest_spectral_features = eigvecs[:, 1].reshape(-1, 1)
+    
+    def _build_node_to_hyperedges(self):
+        node_to_edges = defaultdict(list)
+        for edge_idx, edge in enumerate(self.hyperedges):
+            for node in edge:
+                if 0 <= node < self.nodes_num:
+                    node_to_edges[node].append(edge_idx)
+        return node_to_edges
+    
+    def _build_node_neighbors(self):
+        node_neighbors = defaultdict(set)
+        for node in range(self.nodes_num):
+            for edge_idx in self.node_to_hyperedges[node]:
+                edge = self.hyperedges[edge_idx]
+                node_neighbors[node].update(n for n in edge if 0 <= n < self.nodes_num)
+            node_neighbors[node].discard(node)
+        return node_neighbors
+    
+    def _build_second_neighbors(self):
+        second_neighbors = defaultdict(set)
+        for node in range(self.nodes_num):
+            for neighbor in self.node_to_neighbors[node]:
+                second_neighbors[node].update(n for n in self.node_to_neighbors[neighbor] if 0 <= n < self.nodes_num)
+            second_neighbors[node].discard(node)
+            second_neighbors[node] -= self.node_to_neighbors[node]
+        return second_neighbors
+    
+    def __getitem__(self, idx):
+        features = []
+        current_state = self.inputs[idx]
+        second_smallest_spectral_feat = self.second_smallest_spectral_features[:, 0].reshape(-1, 1)
+        
+        for node in range(self.nodes_num):
+            infected = current_state.get(node, 0)
+            degree = self.degree[node]
+            neighbor_infection = self._get_neighbor_infection(node, current_state)
+            second_neighbor_infection = self._get_second_neighbor_infection(node, current_state)
+            hyperedge_infection = self._get_hyperedge_infection(node, current_state)
+            
+            node_features = [
+                infected,
+                neighbor_infection,
+                second_neighbor_infection,
+                hyperedge_infection,
+                degree,
+                second_smallest_spectral_feat[node, 0],
+            ]
+            features.append(torch.FloatTensor(node_features))
+        
+        x = torch.stack(features)
+        y = torch.FloatTensor([1 if node in self.labels[idx] else 0 for node in range(self.nodes_num)])
+        return x, y, idx, self.inputs[idx]
+    
+    def __len__(self):
+        return len(self.inputs)
+    
+    def _get_neighbor_infection(self, node, current_state):
+        neighbors = self.node_to_neighbors[node]
+        if not neighbors: return 0.0
+        return sum(current_state.get(n, 0) for n in neighbors) / len(neighbors)
+
+    def _get_second_neighbor_infection(self, node, current_state):
+        second_neighbors = self.node_to_second_neighbors[node]
+        if not second_neighbors: return 0.0
+        return sum(current_state.get(n, 0) for n in second_neighbors) / len(second_neighbors)
+    
+    def _get_hyperedge_infection(self, node, current_state):
+        edge_infection = 0.0
+        count = 0
+        for edge_idx in self.node_to_hyperedges[node]:
+            edge = self.hyperedges[edge_idx]
+            if len(edge) <= 1: continue
+            infected_nodes = sum(current_state.get(n, 0) for n in edge if n != node)
+            edge_infection += infected_nodes / (len(edge) - 1)
+            count += 1
+        return edge_infection / count if count > 0 else 0.0
+
+def optimized_get_hypergraph_laplacian(num_vertices, edges_list):
+    num_hyperedges = len(edges_list)
+    rows, cols, data = [], [], []
+    for e_idx, edge in enumerate(edges_list):
+        for v in edge:
+            if 0 <= v < num_vertices:
+                rows.append(v)
+                cols.append(e_idx)
+                data.append(1.0)
+    
+    H = sp.coo_matrix((data, (rows, cols)), shape=(num_vertices, num_hyperedges))
+    D_v_diag = np.array(H.sum(axis=1)).flatten()
+    D_e_diag = np.array(H.sum(axis=0)).flatten() + 1e-10
+    
+    K_V = sp.diags(D_v_diag)
+    K_E_inv = sp.diags(1.0 / D_e_diag)
+    
+    L = K_V - H @ K_E_inv @ H.T
+    return L.tocsr()
+
+def load_real_hypergraph(file_path):
+    hyperedges = []
+    max_node_id = 0
+    with open(file_path, 'r') as f:
+        for line in f:
+            nodes = [int(n) for n in line.strip().split()]
+            if not nodes: continue
+            if min(nodes) > 0: 
+                nodes = [n - 1 for n in nodes]
+            hyperedges.append(nodes)
+            max_node_id = max(max_node_id, max(nodes))
+    
+    vertices = max_node_id + 1
+    unique_hyperedges = []
+    edge_set = set()
+    for edge in hyperedges:
+        t_edge = tuple(sorted(edge))
+        if t_edge not in edge_set:
+            edge_set.add(t_edge)
+            unique_hyperedges.append(list(t_edge))
+            
+    node_set = set()
+    for e in unique_hyperedges: node_set.update(e)
+    for n in range(vertices):
+        if n not in node_set:
+            unique_hyperedges.append([n])
+            
+    return vertices, unique_hyperedges
+
+def _sanitize_hyperedges(nodes_num, edges):
+    sanitized = []
+    for edge in edges:
+        cleaned = []
+        seen = set()
+        for node in edge:
+            if 0 <= node < nodes_num and node not in seen:
+                cleaned.append(node)
+                seen.add(node)
+        if cleaned:
+            sanitized.append(cleaned)
+    if not sanitized and nodes_num > 0:
+        sanitized = [[i] for i in range(nodes_num)]
+    return sanitized
+
+def _sanitize_initial_nodes(nodes_num, initial_nodes):
+    cleaned = []
+    seen = set()
+    for node in initial_nodes:
+        if 0 <= node < nodes_num and node not in seen:
+            cleaned.append(node)
+            seen.add(node)
+    if not cleaned and nodes_num > 0:
+        cleaned = [random.randint(0, nodes_num - 1)]
+    return cleaned
+
+def _build_node_to_hyperedges(nodes_num, edges):
+    node_to_hyperedges = defaultdict(list)
+    for edge_idx, edge in enumerate(edges):
+        for node in edge:
+            if 0 <= node < nodes_num:
+                node_to_hyperedges[node].append(edge_idx)
+    return node_to_hyperedges
+
+def _build_full_state_dict(nodes_num, infected_set):
+    return {i: 1 if i in infected_set else 0 for i in range(nodes_num)}
+
+def optimized_SI_model_hypergraph(nodes_num, edges, activate_rate, initial_nodes, infection_ratio):
+    if nodes_num <= 0:
+        return {}
+
+    edges = _sanitize_hyperedges(nodes_num, edges)
+    initial_nodes = _sanitize_initial_nodes(nodes_num, initial_nodes)
+    target = max(1, int(nodes_num * infection_ratio))
+    target = min(target, nodes_num)
+
+    infected_set = set(initial_nodes)
+    if len(infected_set) > target:
+        infected_set = set(random.sample(list(infected_set), target))
+    if len(infected_set) == target:
+        return _build_full_state_dict(nodes_num, infected_set)
+
+    node_to_hyperedges = _build_node_to_hyperedges(nodes_num, edges)
+    iterations = 0
+    max_iterations = max(1, nodes_num * 10)
+
+    while len(infected_set) < target and iterations < max_iterations:
+        iterations += 1
+        current_infected = list(infected_set)
+        next_new_infected = set()
+        stop_now = False
+
+        for u in current_infected:
+            hyperedge_indices = node_to_hyperedges.get(u, [])
+            if not hyperedge_indices:
+                continue
+
+            chosen_hyperedge = edges[random.choice(hyperedge_indices)]
+            for v in chosen_hyperedge:
+                if v == u or v in infected_set or v in next_new_infected:
+                    continue
+                if random.random() < activate_rate:
+                    next_new_infected.add(v)
+                    if len(infected_set) + len(next_new_infected) == target:
+                        stop_now = True
+                        break
+            if stop_now:
+                break
+
+        infected_set.update(next_new_infected)
+
+        if len(infected_set) == target:
+            break
+        if not next_new_infected:
+            break
+
+    if len(infected_set) > target:
+        infected_set = set(list(infected_set)[:target])
+
+    return _build_full_state_dict(nodes_num, infected_set)
+
+def IC_model_hypergraph_multi(nodes_num, edges, activate_rate, initial_nodes, max_active_nodes):
+    if nodes_num <= 0:
+        return {}
+
+    edges = _sanitize_hyperedges(nodes_num, edges)
+    initial_nodes = _sanitize_initial_nodes(nodes_num, initial_nodes)
+    target = max(1, int(max_active_nodes))
+    target = min(target, nodes_num)
+
+    infected_set = set(initial_nodes)
+    if len(infected_set) > target:
+        infected_set = set(random.sample(list(infected_set), target))
+    if len(infected_set) == target:
+        return _build_full_state_dict(nodes_num, infected_set)
+
+    node_to_hyperedges = _build_node_to_hyperedges(nodes_num, edges)
+    active_nodes = set(infected_set)
+    iterations = 0
+    max_iterations = max(1, nodes_num * 10)
+
+    while active_nodes and len(infected_set) < target and iterations < max_iterations:
+        iterations += 1
+        new_infected = set()
+        stop_now = False
+
+        for u in active_nodes:
+            hyperedge_indices = node_to_hyperedges.get(u, [])
+            if not hyperedge_indices:
+                continue
+
+            chosen_hyperedge = edges[random.choice(hyperedge_indices)]
+            for v in chosen_hyperedge:
+                if v == u or v in infected_set or v in new_infected:
+                    continue
+                if random.random() < activate_rate:
+                    new_infected.add(v)
+                    if len(infected_set) + len(new_infected) == target:
+                        stop_now = True
+                        break
+            if stop_now:
+                break
+
+        infected_set.update(new_infected)
+        active_nodes = set(new_infected)
+
+        if len(infected_set) == target:
+            break
+        if not new_infected:
+            break
+
+    if len(infected_set) > target:
+        infected_set = set(list(infected_set)[:target])
+
+    return _build_full_state_dict(nodes_num, infected_set)
+
+def LT_model_hypergraph_multi(nodes_num, edges, threshold, initial_nodes, max_active_nodes):
+    if nodes_num <= 0:
+        return {}
+
+    edges = _sanitize_hyperedges(nodes_num, edges)
+    initial_nodes = _sanitize_initial_nodes(nodes_num, initial_nodes)
+    target = max(1, int(max_active_nodes))
+    target = min(target, nodes_num)
+
+    infected_set = set(initial_nodes)
+    if len(infected_set) > target:
+        infected_set = set(random.sample(list(infected_set), target))
+    if len(infected_set) == target:
+        return _build_full_state_dict(nodes_num, infected_set)
+
+    node_to_hyperedges = _build_node_to_hyperedges(nodes_num, edges)
+    iterations = 0
+    max_iterations = max(1, nodes_num * 10)
+
+    while len(infected_set) < target and iterations < max_iterations:
+        iterations += 1
+        newly_selected = []
+
+        for v in range(nodes_num):
+            if v in infected_set:
+                continue
+
+            incident_edges = node_to_hyperedges.get(v, [])
+            if not incident_edges:
+                continue
+
+            influence_sum = 0.0
+            for edge_idx in incident_edges:
+                edge = edges[edge_idx]
+                infected_in_edge = sum(1 for node in edge if node in infected_set)
+                influence_sum += infected_in_edge / len(edge)
+
+            I_to_v = influence_sum / len(incident_edges)
+            if I_to_v > threshold:
+                newly_selected.append(v)
+
+        if not newly_selected:
+            break
+
+        stop_now = False
+        for v in newly_selected:
+            if v in infected_set:
+                continue
+            infected_set.add(v)
+            if len(infected_set) == target:
+                stop_now = True
+                break
+
+        if stop_now:
+            break
+
+    if len(infected_set) > target:
+        infected_set = set(list(infected_set)[:target])
+
+    return _build_full_state_dict(nodes_num, infected_set)
+
+def generate_infection_graphs(num_graphs, nodes_num, hyperedges, infection_rate, infection_ratio, source_nodes_count, model_type="IC", threshold=0.5):
+    if nodes_num <= 0:
+        return [], []
+
+    hyperedges = _sanitize_hyperedges(nodes_num, hyperedges)
+    infection_graphs = []
+    source_nodes_list = []
+    target_active_nodes = max(1, int(nodes_num * infection_ratio))
+    target_active_nodes = min(target_active_nodes, nodes_num)
+    source_sample_size = max(1, int(source_nodes_count))
+    source_sample_size = min(source_sample_size, nodes_num, target_active_nodes)
+
+    while len(infection_graphs) < num_graphs:
+        if source_sample_size >= nodes_num:
+            source_nodes = list(range(nodes_num))
+            if len(source_nodes) > target_active_nodes:
+                source_nodes = random.sample(source_nodes, target_active_nodes)
+        else:
+            source_nodes = random.sample(range(nodes_num), source_sample_size)
+
+        if model_type == "SI":
+            node_states = optimized_SI_model_hypergraph(
+                nodes_num,
+                hyperedges,
+                infection_rate,
+                source_nodes,
+                infection_ratio,
+            )
+        elif model_type == "LT":
+            node_states = LT_model_hypergraph_multi(
+                nodes_num,
+                hyperedges,
+                threshold,
+                source_nodes,
+                target_active_nodes,
+            )
+        elif model_type == "IC":
+            node_states = IC_model_hypergraph_multi(
+                nodes_num,
+                hyperedges,
+                infection_rate,
+                source_nodes,
+                target_active_nodes,
+            )
+        else:
+            raise ValueError(f"Unsupported model_type: {model_type}")
+
+        infected_count = sum(1 for node in range(nodes_num) if node_states.get(node, 0) == 1)
+        if infected_count == target_active_nodes:
+            infection_graphs.append(_build_full_state_dict(nodes_num, {n for n, s in node_states.items() if s == 1}))
+            source_nodes_list.append(source_nodes)
+
+    return infection_graphs, source_nodes_list
