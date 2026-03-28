@@ -1,0 +1,113 @@
+import torch
+import random
+from dhg import Hypergraph
+
+def compute_incidence_matrix(num_nodes, hyperedges, device):
+    num_hyperedges = len(hyperedges)
+    H = torch.zeros((num_nodes, num_hyperedges), device=device)
+    for j, edge in enumerate(hyperedges):
+        for i in edge:
+            H[i, j] = 1
+    return H
+
+def augment_hypergraph_structure(hypergraph, mu=0.1, xi=0.1):
+    if random.random() < 0.5:
+        return hyperedge_dropout(hypergraph, dropout_rate=mu)
+    else:
+        return hyperedge_perturbation(hypergraph, perturbation_rate=xi)
+
+def hyperedge_dropout(hypergraph, dropout_rate=0.1):
+    edges = [list(edge) for edge in hypergraph.e[0]]
+    if not edges:
+        return Hypergraph(hypergraph.num_v, [[i] for i in range(hypergraph.num_v)])
+
+    new_edges = [edge for edge in edges if random.random() >= dropout_rate]
+    if not new_edges:
+        new_edges = [list(random.choice(edges))]
+
+    return Hypergraph(hypergraph.num_v, new_edges)
+
+def hyperedge_perturbation(hypergraph, perturbation_rate=0.1):
+    all_nodes = list(range(hypergraph.num_v))
+    new_edges = []
+    for edge in hypergraph.e[0]:
+        new_edge = list(edge)
+        if random.random() >= perturbation_rate:
+            new_edges.append(new_edge)
+            continue
+
+        edge_set = set(new_edge)
+        candidates = [node for node in all_nodes if node not in edge_set]
+        can_remove = len(new_edge) > 2
+        can_add = len(candidates) > 0
+
+        if can_remove and can_add:
+            if random.random() < 0.5:
+                remove_idx = random.randrange(len(new_edge))
+                new_edge.pop(remove_idx)
+            else:
+                new_edge.append(random.choice(candidates))
+        elif can_remove:
+            remove_idx = random.randrange(len(new_edge))
+            new_edge.pop(remove_idx)
+        elif can_add:
+            new_edge.append(random.choice(candidates))
+
+        new_edges.append(new_edge)
+
+    if not new_edges and hypergraph.num_v > 0:
+        new_edges = [[i] for i in range(hypergraph.num_v)]
+
+    return Hypergraph(hypergraph.num_v, new_edges)
+
+def calculate_accuracy_f1(predicted_list, y_list):
+    if not isinstance(predicted_list, list):
+        predicted_list = predicted_list.tolist() if hasattr(predicted_list, 'tolist') else list(predicted_list)
+    if not isinstance(y_list, list):
+        y_list = y_list.tolist() if hasattr(y_list, 'tolist') else list(y_list)
+    
+    correct_predictions = sum(1 for pred, true in zip(predicted_list, y_list) if pred == true)
+    total_samples = len(y_list)
+    accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
+    
+    predicted_set = {i for i, val in enumerate(predicted_list) if val == 1}
+    y_set = {i for i, val in enumerate(y_list) if val == 1}
+    
+    true_positives = len(predicted_set & y_set)
+    false_positives = len(predicted_set - y_set)
+    false_negatives = len(y_set - predicted_set)
+    
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    return accuracy, f1
+
+def evaluate_source_detection(predicted_sources, true_sources, nodes_num):
+    pred_set = set(predicted_sources)
+    true_set = set(true_sources)
+    
+    intersection = pred_set.intersection(true_set)
+    union = pred_set.union(true_set)
+    
+    tp = len(intersection)
+    fp = len(pred_set) - tp
+    fn = len(true_set) - tp
+    tn = nodes_num - len(union)
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    jaccard = len(intersection) / len(union) if len(union) > 0 else 0.0
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1_score,
+        'jaccard': jaccard,
+        'accuracy': accuracy,
+        'correct_count': tp,
+        'predicted_count': len(pred_set),
+        'true_count': len(true_set)
+    }
